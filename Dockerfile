@@ -16,27 +16,37 @@ RUN apt-get update && apt-get install -y \
 # Create app directory
 WORKDIR /app
 
-# Copy and install Python dependencies first (for better caching)
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy main application file
+COPY main.py .
+
+# Copy the entire app directory (preserving structure)
+COPY app/ ./app/
+
+# Create static directory if it doesn't exist (for FastAPI static files)
+RUN mkdir -p app/static
 
 # Create non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser \
     && chown -R appuser:appuser /app
+
+# Switch to non-root user
 USER appuser
 
-# Expose port (Cloud Run will set PORT env var)
+# Expose port
 EXPOSE $PORT
 
 # Health check for Cloud Run
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:$PORT/health || exit 1
 
-# Run the application with optimized settings for Cloud Run
+# Run the application
 CMD exec uvicorn main:app \
     --host 0.0.0.0 \
     --port $PORT \

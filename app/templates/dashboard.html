@@ -67,6 +67,7 @@
             padding: 20px;
             text-align: center;
             box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+            position: relative;
         }
 
         .status-card h3 {
@@ -82,6 +83,50 @@
             font-size: 1.8rem;
             font-weight: 700;
             color: #2d3748;
+        }
+
+        .wallet-count-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            position: relative;
+        }
+
+        .wallet-count-card h3 {
+            color: rgba(255, 255, 255, 0.9);
+        }
+
+        .wallet-count-card .value {
+            color: white;
+        }
+
+        .wallet-refresh-btn {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            cursor: pointer;
+            color: white;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+
+        .wallet-refresh-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: rotate(90deg);
+        }
+
+        .wallet-refresh-btn.loading {
+            animation: spin 1s linear infinite;
+        }
+
+        .wallet-source {
+            font-size: 0.7rem;
+            margin-top: 4px;
+            opacity: 0.8;
         }
 
         .global-controls {
@@ -203,11 +248,25 @@
             border-radius: 6px;
             font-size: 0.9rem;
             transition: border-color 0.2s;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
         }
 
         .frequency-input:focus {
             outline: none;
             border-color: #667eea;
+        }
+
+        .cron-update-container {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .cron-description {
+            font-size: 0.8rem;
+            color: #666;
+            font-style: italic;
         }
 
         .job-actions {
@@ -267,6 +326,11 @@
             background: #38a169;
         }
 
+        .btn-update {
+            flex-shrink: 0;
+            padding: 8px 12px;
+        }
+
         .logs-section {
             background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(10px);
@@ -317,6 +381,15 @@
             animation: spin 1s linear infinite;
         }
 
+        .error-message {
+            color: #f56565;
+            background: rgba(245, 101, 101, 0.1);
+            padding: 10px;
+            border-radius: 8px;
+            margin: 10px 0;
+            border: 1px solid rgba(245, 101, 101, 0.2);
+        }
+
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
@@ -335,6 +408,11 @@
                 grid-template-columns: 1fr;
                 text-align: center;
             }
+
+            .cron-update-container {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
     </style>
 </head>
@@ -347,6 +425,7 @@
                 <div><strong>Project:</strong> {{ project_id }}</div>
                 <div><strong>Region:</strong> {{ region }}</div>
                 <div><strong>Function:</strong> Analysis Service</div>
+                <div><strong>Wallet API:</strong> <span id="walletApiStatus">Checking...</span></div>
             </div>
         </div>
 
@@ -358,6 +437,14 @@
             <div class="status-card">
                 <h3>Total Jobs</h3>
                 <div class="value" id="totalJobs">-</div>
+            </div>
+            <div class="status-card wallet-count-card">
+                <h3>Available Wallets</h3>
+                <div class="value" id="walletCount">-</div>
+                <div class="wallet-source" id="walletSource">Loading...</div>
+                <button class="wallet-refresh-btn" id="walletRefreshBtn" onclick="refreshWalletCount()" title="Refresh wallet count">
+                    ↻
+                </button>
             </div>
             <div class="status-card">
                 <h3>Total Executions</h3>
@@ -372,10 +459,11 @@
         <div class="global-controls">
             <h2>Global Controls</h2>
             <div class="global-actions">
+                <button class="btn btn-success" onclick="createDefaultJobs()">Create Optimized Base Jobs</button>
+                <button class="btn btn-primary" onclick="showScheduleDetails()">Show Schedule Details</button>
                 <button class="btn btn-success" onclick="resumeAllJobs()">Resume All Jobs</button>
                 <button class="btn btn-warning" onclick="pauseAllJobs()">Pause All Jobs</button>
                 <button class="btn btn-primary" onclick="refreshStatus()">Refresh Status</button>
-                <button class="btn btn-primary" onclick="createDefaultJobs()">Create Default Jobs</button>
             </div>
         </div>
 
@@ -407,18 +495,62 @@
         };
 
         let jobsData = [];
+        let currentWalletCount = 0;
         let refreshInterval;
 
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
             addLog('info', 'Dashboard loaded successfully');
-            refreshStatus();
+            
+            // Initial load with error handling
+            initializeDashboard();
             
             // Auto-refresh every 30 seconds
             refreshInterval = setInterval(refreshStatus, 30000);
         });
 
-        // API helper function
+        // Initialize dashboard with comprehensive error handling
+        async function initializeDashboard() {
+            try {
+                addLog('info', 'Initializing dashboard...');
+                
+                // Test API connectivity first
+                await testApiConnectivity();
+                
+                // Load all data
+                await refreshStatus();
+                
+                addLog('success', 'Dashboard initialized successfully');
+            } catch (error) {
+                addLog('error', `Dashboard initialization failed: ${error.message}`);
+                showErrorState('Failed to initialize dashboard');
+            }
+        }
+
+        // Test API connectivity
+        async function testApiConnectivity() {
+            try {
+                const response = await fetch(`${CONFIG.API_BASE}/status`, { 
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 10000
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`API returned ${response.status}`);
+                }
+                
+                document.getElementById('walletApiStatus').textContent = 'Connected';
+                document.getElementById('walletApiStatus').style.color = '#48bb78';
+                return true;
+            } catch (error) {
+                document.getElementById('walletApiStatus').textContent = 'Error';
+                document.getElementById('walletApiStatus').style.color = '#f56565';
+                throw new Error(`API connectivity test failed: ${error.message}`);
+            }
+        }
+
+        // API helper function with better error handling
         async function apiCall(endpoint, method = 'GET', data = null) {
             try {
                 const options = {
@@ -432,54 +564,215 @@
                     options.body = JSON.stringify(data);
                 }
                 
+                addLog('info', `API call: ${method} ${endpoint}`);
+                
                 const response = await fetch(`${CONFIG.API_BASE}${endpoint}`, options);
                 
                 if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText}`);
                 }
                 
-                return await response.json();
+                const result = await response.json();
+                addLog('success', `API call successful: ${method} ${endpoint}`);
+                return result;
+                
             } catch (error) {
-                addLog('error', `API call failed: ${error.message}`);
+                addLog('error', `API call failed: ${method} ${endpoint} - ${error.message}`);
                 throw error;
             }
         }
 
-        // Refresh status and jobs
+        // Function to get human-readable schedule description
+        function getScheduleDescription(cron) {
+            if (!cron) return 'No schedule set';
+            
+            const scheduleMap = {
+                '0 */4 * * *': 'Every 4 hours',
+                '30 */6 * * *': 'Every 6 hours', 
+                '15 */4 * * *': 'Every 4 hours (15 min past)',
+                '45 */6 * * *': 'Every 6 hours (45 min past)',
+                '30 20,21,23,1,5,7,8,10 * * *': 'Optimized Base Buy (8 times/day)',
+                '30 20,22,0,3,6,9,11 * * *': 'Optimized Base Sell (7 times/day)',
+                '0 */3 * * *': 'Every 3 hours',
+                '*/15 * * * *': 'Every 15 minutes',
+                '*/30 * * * *': 'Every 30 minutes',
+                '0 * * * *': 'Every hour',
+                '0 */2 * * *': 'Every 2 hours',
+                '0 */12 * * *': 'Every 12 hours',
+                '0 0 * * *': 'Daily at midnight',
+                '0 9 * * *': 'Daily at 9 AM'
+            };
+            
+            return scheduleMap[cron] || `Custom: ${cron}`;
+        }
+
+        // Function to update job schedule
+        async function updateJobSchedule(jobId) {
+            try {
+                const cronInput = document.getElementById(`cron-${jobId}`);
+                const newSchedule = cronInput.value.trim();
+                
+                if (!newSchedule) {
+                    addLog('error', 'Please enter a valid cron expression');
+                    return;
+                }
+                
+                // Validate basic cron format (5 parts)
+                const cronParts = newSchedule.split(' ');
+                if (cronParts.length !== 5) {
+                    addLog('error', 'Cron expression must have exactly 5 parts (minute hour day month weekday)');
+                    return;
+                }
+                
+                addLog('info', `Updating schedule for job ${jobId} to: ${newSchedule}`);
+                
+                const result = await apiCall(`/jobs/${jobId}/schedule`, 'PUT', { schedule: newSchedule });
+                addLog('success', `Job ${jobId} schedule updated successfully`);
+                addLog('info', `New schedule: ${getScheduleDescription(newSchedule)}`);
+                
+                // Refresh to show updated schedule
+                refreshStatus();
+                
+            } catch (error) {
+                addLog('error', `Failed to update schedule for job ${jobId}: ${error.message}`);
+            }
+        }
+
+        // Refresh wallet count with detailed logging
+        async function refreshWalletCount() {
+            const refreshBtn = document.getElementById('walletRefreshBtn');
+            const walletCountEl = document.getElementById('walletCount');
+            const walletSourceEl = document.getElementById('walletSource');
+            
+            try {
+                refreshBtn.classList.add('loading');
+                addLog('info', 'Refreshing wallet count...');
+                
+                const walletData = await apiCall('/wallets/count');
+                
+                addLog('info', `Wallet API response: ${JSON.stringify(walletData)}`);
+                
+                currentWalletCount = walletData.count || 0;
+                walletCountEl.textContent = currentWalletCount.toLocaleString();
+                
+                if (walletData.success) {
+                    walletSourceEl.textContent = `From ${walletData.source}`;
+                    walletSourceEl.style.color = 'rgba(255, 255, 255, 0.9)';
+                    addLog('success', `Wallet count updated: ${currentWalletCount.toLocaleString()} wallets from ${walletData.source}`);
+                } else {
+                    walletSourceEl.textContent = `Fallback (${walletData.source})`;
+                    walletSourceEl.style.color = 'rgba(255, 255, 255, 0.7)';
+                    addLog('warning', `Using fallback wallet count: ${currentWalletCount.toLocaleString()} (${walletData.error || 'Unknown error'})`);
+                }
+                
+            } catch (error) {
+                addLog('error', `Failed to refresh wallet count: ${error.message}`);
+                walletCountEl.textContent = 'Error';
+                walletSourceEl.textContent = 'Connection failed';
+                walletSourceEl.style.color = 'rgba(255, 255, 255, 0.7)';
+            } finally {
+                refreshBtn.classList.remove('loading');
+            }
+        }
+
+        // Refresh status and jobs with comprehensive error handling
         async function refreshStatus() {
             try {
                 addLog('info', 'Refreshing status...');
                 
-                // Get jobs
-                jobsData = await apiCall('/jobs');
+                // Get jobs with error handling
+                try {
+                    jobsData = await apiCall('/jobs');
+                    addLog('success', `Loaded ${jobsData.length} jobs`);
+                } catch (error) {
+                    addLog('error', `Failed to load jobs: ${error.message}`);
+                    jobsData = [];
+                }
                 
-                // Get status
-                const status = await apiCall('/status');
-                
-                // Update overview
-                document.getElementById('activeJobs').textContent = status.active_jobs;
-                document.getElementById('totalJobs').textContent = status.total_jobs;
-                document.getElementById('totalExecutions').textContent = status.total_executions;
-                document.getElementById('successRate').textContent = status.success_rate + '%';
+                // Get status with error handling
+                try {
+                    const status = await apiCall('/status');
+                    addLog('success', `Status loaded: ${JSON.stringify(status)}`);
+                    
+                    // Update overview with safe access
+                    updateElement('activeJobs', status.active_jobs ?? 0);
+                    updateElement('totalJobs', status.total_jobs ?? 0);
+                    updateElement('totalExecutions', status.total_executions ?? 0);
+                    updateElement('successRate', (status.success_rate ?? 0) + '%');
+                    
+                    // Update wallet count
+                    currentWalletCount = status.wallet_count || 0;
+                    updateElement('walletCount', currentWalletCount.toLocaleString());
+                    
+                    const walletSourceEl = document.getElementById('walletSource');
+                    if (status.wallet_count_success) {
+                        walletSourceEl.textContent = `From ${status.wallet_count_source || 'API'}`;
+                        walletSourceEl.style.color = 'rgba(255, 255, 255, 0.9)';
+                    } else {
+                        walletSourceEl.textContent = `Fallback (${status.wallet_count_source || 'unknown'})`;
+                        walletSourceEl.style.color = 'rgba(255, 255, 255, 0.7)';
+                    }
+                    
+                } catch (error) {
+                    addLog('error', `Failed to load status: ${error.message}`);
+                    showErrorState('Failed to load status');
+                }
                 
                 // Render jobs
                 renderJobs();
                 
-                addLog('success', `Status updated: ${status.active_jobs} active jobs`);
+                addLog('success', `Status refresh completed: ${jobsData.length} jobs, ${currentWalletCount.toLocaleString()} wallets available`);
+                
             } catch (error) {
-                addLog('error', `Failed to refresh status: ${error.message}`);
+                addLog('error', `Status refresh failed: ${error.message}`);
+                showErrorState('Status refresh failed');
             }
         }
 
-        // Render jobs grid
+        // Safe element update
+        function updateElement(id, value) {
+            const element = document.getElementById(id);
+            if (element) {
+                element.textContent = value;
+            } else {
+                addLog('warning', `Element not found: ${id}`);
+            }
+        }
+
+        // Show error state
+        function showErrorState(message) {
+            const grid = document.getElementById('jobsGrid');
+            if (grid) {
+                grid.innerHTML = `
+                    <div style="grid-column: 1 / -1; text-align: center; padding: 40px;">
+                        <div class="error-message">
+                            <h3>⚠️ ${message}</h3>
+                            <p>Check the console logs for more details</p>
+                            <button class="btn btn-primary" onclick="refreshStatus()" style="margin-top: 15px;">
+                                Try Again
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        // Render jobs grid with editable cron expressions
         function renderJobs() {
             const grid = document.getElementById('jobsGrid');
+            
+            if (!grid) {
+                addLog('error', 'Jobs grid element not found');
+                return;
+            }
             
             if (jobsData.length === 0) {
                 grid.innerHTML = `
                     <div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: #666;">
                         <h3>No Jobs Found</h3>
-                        <p>Click "Create Default Jobs" to set up your crypto analysis jobs</p>
+                        <p>Click "Create Optimized Base Jobs" to set up your crypto analysis jobs</p>
+                        <p style="margin-top: 10px; font-size: 0.9rem;">Jobs will use all ${currentWalletCount.toLocaleString()} available wallets</p>
                     </div>
                 `;
                 return;
@@ -488,58 +781,70 @@
             grid.innerHTML = '';
             
             jobsData.forEach(job => {
-                const jobCard = document.createElement('div');
-                jobCard.className = 'job-card';
-                
-                const statusClass = `status-${job.state.toLowerCase()}`;
-                const isEnabled = job.state === 'ENABLED';
-                
-                jobCard.innerHTML = `
-                    <div class="job-header">
-                        <div class="job-title">${job.name}</div>
-                        <div class="job-status ${statusClass}">${job.state}</div>
-                    </div>
+                try {
+                    const jobCard = document.createElement('div');
+                    jobCard.className = 'job-card';
                     
-                    <div class="job-details">
-                        <div class="job-detail">
-                            <span class="label">Network:</span>
-                            <span class="value">${job.network.toUpperCase()}</span>
+                    const statusClass = `status-${(job.state || 'unknown').toLowerCase()}`;
+                    const isEnabled = job.state === 'ENABLED';
+                    
+                    jobCard.innerHTML = `
+                        <div class="job-header">
+                            <div class="job-title">${job.name || 'Unknown Job'}</div>
+                            <div class="job-status ${statusClass}">${job.state || 'UNKNOWN'}</div>
                         </div>
-                        <div class="job-detail">
-                            <span class="label">Type:</span>
-                            <span class="value">${job.analysis_type.toUpperCase()}</span>
+                        
+                        <div class="job-details">
+                            <div class="job-detail">
+                                <span class="label">Network:</span>
+                                <span class="value">${(job.network || 'unknown').toUpperCase()}</span>
+                            </div>
+                            <div class="job-detail">
+                                <span class="label">Type:</span>
+                                <span class="value">${(job.analysis_type || 'unknown').toUpperCase()}</span>
+                            </div>
+                            <div class="job-detail">
+                                <span class="label">Wallets:</span>
+                                <span class="value">${currentWalletCount.toLocaleString()} (max available)</span>
+                            </div>
+                            <div class="job-detail">
+                                <span class="label">Executions:</span>
+                                <span class="value">${job.execution_count || 0} (${job.success_count || 0} success)</span>
+                            </div>
                         </div>
-                        <div class="job-detail">
-                            <span class="label">Schedule:</span>
-                            <span class="value">${job.schedule}</span>
-                        </div>
-                        <div class="job-detail">
-                            <span class="label">Executions:</span>
-                            <span class="value">${job.execution_count} (${job.success_count} success)</span>
-                        </div>
-                    </div>
 
-                    <div class="frequency-controls">
-                        <h4>Schedule (Cron Expression)</h4>
-                        <input type="text" class="frequency-input" value="${job.schedule}" 
-                               placeholder="0 */4 * * * (every 4 hours)" readonly>
-                    </div>
+                        <div class="frequency-controls">
+                            <h4>Schedule (Cron Expression)</h4>
+                            <div class="cron-update-container">
+                                <input type="text" class="frequency-input" id="cron-${job.id}" value="${job.schedule || ''}" 
+                                       placeholder="30 20,21,23,1,5,7,8,10 * * *">
+                                <button class="btn btn-primary btn-update" onclick="updateJobSchedule('${job.id}')">
+                                    Update
+                                </button>
+                            </div>
+                            <div class="cron-description">
+                                ${getScheduleDescription(job.schedule)}
+                            </div>
+                        </div>
 
-                    <div class="job-actions">
-                        ${isEnabled ? 
-                            `<button class="btn btn-warning" onclick="pauseJob('${job.id}')">Pause</button>` :
-                            `<button class="btn btn-success" onclick="resumeJob('${job.id}')">Resume</button>`
-                        }
-                        <button class="btn btn-primary" onclick="runJobNow('${job.id}')">Run Now</button>
-                        <button class="btn btn-danger" onclick="deleteJob('${job.id}')">Delete</button>
-                    </div>
-                `;
-                
-                grid.appendChild(jobCard);
+                        <div class="job-actions">
+                            ${isEnabled ? 
+                                `<button class="btn btn-warning" onclick="pauseJob('${job.id}')">Pause</button>` :
+                                `<button class="btn btn-success" onclick="resumeJob('${job.id}')">Resume</button>`
+                            }
+                            <button class="btn btn-primary" onclick="runJobNow('${job.id}')">Run Now</button>
+                            <button class="btn btn-danger" onclick="deleteJob('${job.id}')">Delete</button>
+                        </div>
+                    `;
+                    
+                    grid.appendChild(jobCard);
+                } catch (error) {
+                    addLog('error', `Failed to render job: ${error.message}`);
+                }
             });
         }
 
-        // Job control functions
+        // Job control functions with better error handling
         async function pauseJob(jobId) {
             try {
                 addLog('info', `Pausing job: ${jobId}`);
@@ -564,11 +869,17 @@
 
         async function runJobNow(jobId) {
             try {
-                addLog('info', `Running job immediately: ${jobId}`);
-                const result = await apiCall(`/jobs/${jobId}/run`, 'POST');
+                addLog('info', `Running job immediately: ${jobId} with ${currentWalletCount.toLocaleString()} wallets`);
+                
+                const requestData = {
+                    num_wallets: 0, // This will trigger the API to use the latest wallet count
+                    days_back: 1.0
+                };
+                
+                const result = await apiCall(`/jobs/${jobId}/run`, 'POST', requestData);
                 
                 if (result.result) {
-                    addLog('success', `Job ${jobId} completed: ${result.result.transactions} transactions, ${result.result.tokens} tokens`);
+                    addLog('success', `Job ${jobId} completed: ${result.result.transactions} transactions, ${result.result.tokens} tokens, ${result.result.wallets_used} wallets used`);
                 } else {
                     addLog('success', result.message || `Job ${jobId} triggered`);
                 }
@@ -617,12 +928,51 @@
 
         async function createDefaultJobs() {
             try {
-                addLog('info', 'Creating default jobs...');
+                addLog('info', 'Creating optimized Base analysis jobs...');
                 
                 const templates = await apiCall('/job-templates');
                 let created = 0;
                 
-                for (const template of templates.templates) {
+                addLog('info', `Using ${templates.max_wallets.toLocaleString()} wallets for all jobs (from ${templates.wallet_source})`);
+                
+                // Prioritize the optimized Base templates
+                const priorityTemplates = [
+                    'crypto-buy-analysis-base-optimized',
+                    'crypto-sell-analysis-base-optimized'
+                ];
+                
+                // Create optimized Base jobs first
+                for (const templateId of priorityTemplates) {
+                    const template = templates.templates.find(t => t.id === templateId);
+                    if (template) {
+                        try {
+                            await apiCall('/jobs', 'POST', {
+                                id: template.id,
+                                name: template.name,
+                                network: template.network,
+                                analysis_type: template.analysis_type,
+                                schedule: template.schedule,
+                                description: template.description,
+                                num_wallets: template.num_wallets,
+                                days_back: template.analysis_type === 'sell' ? 2.0 : 1.0
+                            });
+                            created++;
+                            addLog('success', `✅ Created ${template.name} with optimized schedule`);
+                            addLog('info', `   Schedule: ${template.schedule} (${getScheduleDescription(template.schedule)})`);
+                            
+                        } catch (error) {
+                            if (error.message.includes('already exists')) {
+                                addLog('info', `Job ${template.id} already exists`);
+                            } else {
+                                addLog('error', `Failed to create ${template.id}: ${error.message}`);
+                            }
+                        }
+                    }
+                }
+                
+                // Optionally create Ethereum jobs too
+                const ethereumTemplates = templates.templates.filter(t => t.network === 'ethereum');
+                for (const template of ethereumTemplates) {
                     try {
                         await apiCall('/jobs', 'POST', {
                             id: template.id,
@@ -631,10 +981,11 @@
                             analysis_type: template.analysis_type,
                             schedule: template.schedule,
                             description: template.description,
-                            num_wallets: 100,
+                            num_wallets: template.num_wallets,
                             days_back: template.analysis_type === 'sell' ? 2.0 : 1.0
                         });
                         created++;
+                        addLog('success', `Created ${template.name}`);
                     } catch (error) {
                         if (error.message.includes('already exists')) {
                             addLog('info', `Job ${template.id} already exists`);
@@ -644,32 +995,91 @@
                     }
                 }
                 
-                addLog('success', `Created ${created} default jobs`);
+                if (created > 0) {
+                    addLog('success', `🎉 Created ${created} jobs with optimized schedules!`);
+                    addLog('info', `💡 All jobs use ${templates.max_wallets.toLocaleString()} wallets for maximum coverage`);
+                    addLog('info', `🔧 You can edit schedules directly in each job card`);
+                } else {
+                    addLog('info', 'All optimized jobs already exist - ready to go!');
+                }
+                
                 refreshStatus();
             } catch (error) {
                 addLog('error', `Failed to create default jobs: ${error.message}`);
             }
         }
 
-        // Logging function
-        function addLog(type, message) {
-            const timestamp = new Date().toLocaleString();
-            const logEntry = document.createElement('div');
-            logEntry.className = 'log-entry';
-            logEntry.innerHTML = `
-                <span class="log-timestamp">[${timestamp}]</span>
-                <span class="log-${type}">${message}</span>
-            `;
-            
-            const container = document.getElementById('logsContainer');
-            container.appendChild(logEntry);
-            container.scrollTop = container.scrollHeight;
-            
-            // Keep only last 100 log entries
-            while (container.children.length > 100) {
-                container.removeChild(container.firstChild);
+        // Add a function to show schedule details
+        async function showScheduleDetails() {
+            try {
+                addLog('info', '📅 COMMON CRON EXPRESSIONS:');
+                addLog('info', '');
+                addLog('info', '⏰ Frequent Schedules:');
+                addLog('info', '   */15 * * * * = Every 15 minutes');
+                addLog('info', '   */30 * * * * = Every 30 minutes');
+                addLog('info', '   0 * * * * = Every hour');
+                addLog('info', '   0 */2 * * * = Every 2 hours');
+                addLog('info', '   0 */3 * * * = Every 3 hours');
+                addLog('info', '   0 */4 * * * = Every 4 hours');
+                addLog('info', '   0 */6 * * * = Every 6 hours');
+                addLog('info', '');
+                addLog('info', '🎯 Optimized Base Schedules:');
+                addLog('info', '   30 20,21,23,1,5,7,8,10 * * * = Base Buy (8 times/day)');
+                addLog('info', '   30 20,22,0,3,6,9,11 * * * = Base Sell (7 times/day)');
+                addLog('info', '');
+                addLog('info', '📝 Format: minute hour day month weekday');
+                addLog('info', '💡 Times are in UTC. Convert from NZDST by subtracting 13 hours');
+                
+            } catch (error) {
+                addLog('error', `Failed to show schedule details: ${error.message}`);
             }
         }
+
+        // Logging function with better error handling
+        function addLog(type, message) {
+            try {
+                const timestamp = new Date().toLocaleString();
+                const logEntry = document.createElement('div');
+                logEntry.className = 'log-entry';
+                logEntry.innerHTML = `
+                    <span class="log-timestamp">[${timestamp}]</span>
+                    <span class="log-${type}">${message}</span>
+                `;
+                
+                const container = document.getElementById('logsContainer');
+                if (container) {
+                    container.appendChild(logEntry);
+                    container.scrollTop = container.scrollHeight;
+                    
+                    // Keep only last 100 log entries
+                    while (container.children.length > 100) {
+                        container.removeChild(container.firstChild);
+                    }
+                } else {
+                    console.log(`[${timestamp}] ${type.toUpperCase()}: ${message}`);
+                }
+            } catch (error) {
+                console.error('Logging failed:', error);
+                console.log(`[${new Date().toLocaleString()}] ${type.toUpperCase()}: ${message}`);
+            }
+        }
+
+        // Handle page visibility change to refresh when user returns
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) {
+                addLog('info', 'Page became visible, refreshing status...');
+                refreshStatus();
+            }
+        });
+
+        // Handle errors globally
+        window.addEventListener('error', function(event) {
+            addLog('error', `JavaScript error: ${event.error.message}`);
+        });
+
+        window.addEventListener('unhandledrejection', function(event) {
+            addLog('error', `Unhandled promise rejection: ${event.reason}`);
+        });
     </script>
 </body>
 </html>
