@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from app.models.job import (
     SchedulerJob, JobCreateRequest, JobUpdateRequest, 
     JobExecutionRequest, NetworkType, AnalysisType
 )
 from app.services.scheduler import scheduler_service
+from app.services.config import get_settings, Settings
 from typing import List
 import httpx
 import logging
@@ -11,15 +12,13 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Wallet API endpoint
-WALLET_API_URL = "https://wallet-api-bigquery-qz6f5mkbmq-as.a.run.app"
-
 @router.get("/wallets/count")
-async def get_wallet_count():
-    """Get the current wallet count from the wallet API"""
+async def get_wallet_count(settings: Settings = Depends(get_settings)):
+    """Get the current wallet count from the wallet API using config settings"""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{WALLET_API_URL}/wallets/count")
+        timeout = httpx.Timeout(settings.wallet_api_timeout)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{settings.wallet_api_url}/wallets/count")
             
             if response.status_code == 200:
                 # Handle different response formats
@@ -57,7 +56,9 @@ async def get_wallet_count():
                 return {
                     "success": True,
                     "count": count,
-                    "source": "wallet-api"
+                    "source": "wallet-api",
+                    "api_url": settings.wallet_api_url,
+                    "timeout_used": settings.wallet_api_timeout
                 }
             else:
                 logger.error(f"Wallet API returned HTTP {response.status_code}")
@@ -65,7 +66,8 @@ async def get_wallet_count():
                     "success": False,
                     "count": 1000,  # Fallback value
                     "source": "fallback",
-                    "error": f"API returned HTTP {response.status_code}"
+                    "error": f"API returned HTTP {response.status_code}",
+                    "api_url": settings.wallet_api_url
                 }
                 
     except Exception as e:
@@ -74,8 +76,27 @@ async def get_wallet_count():
             "success": False,
             "count": 1000,  # Fallback value
             "source": "fallback",
-            "error": str(e)
+            "error": str(e),
+            "api_url": settings.wallet_api_url
         }
+
+@router.get("/config")
+async def get_config_info(settings: Settings = Depends(get_settings)):
+    """Get current configuration (safe values only)"""
+    return {
+        "app_name": settings.app_name,
+        "app_version": settings.app_version,
+        "debug": settings.debug,
+        "google_cloud_project": settings.google_cloud_project,
+        "google_cloud_region": settings.google_cloud_region,
+        "crypto_function_url": settings.crypto_function_url,
+        "wallet_api_url": settings.wallet_api_url,
+        "api_timeout": settings.api_timeout,
+        "wallet_api_timeout": settings.wallet_api_timeout,
+        "max_retries": settings.max_retries,
+        "rate_limit_enabled": settings.rate_limit_enabled,
+        # Don't expose sensitive values like secret_key or admin_password
+    }
 
 @router.get("/jobs", response_model=List[SchedulerJob])
 async def list_jobs():
@@ -102,11 +123,14 @@ async def get_job(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs", response_model=dict)
-async def create_job(job_request: JobCreateRequest):
+async def create_job(
+    job_request: JobCreateRequest, 
+    settings: Settings = Depends(get_settings)
+):
     """Create a new scheduler job - ALWAYS uses max available wallets"""
     try:
         # ALWAYS get the current max wallet count - ignore any provided value
-        wallet_count_data = await get_wallet_count()
+        wallet_count_data = await get_wallet_count(settings)
         actual_wallet_count = wallet_count_data["count"]
         
         # Override any provided num_wallets with the current max
@@ -122,7 +146,11 @@ async def create_job(job_request: JobCreateRequest):
             "success": True, 
             "message": f"Job {job_request.id} created successfully with {actual_wallet_count} wallets (max available)",
             "wallet_count": actual_wallet_count,
-            "wallet_source": wallet_count_data["source"]
+            "wallet_source": wallet_count_data["source"],
+            "config_used": {
+                "crypto_function_url": settings.crypto_function_url,
+                "timeout": settings.api_timeout
+            }
         }
     except HTTPException:
         raise
@@ -130,38 +158,87 @@ async def create_job(job_request: JobCreateRequest):
         logger.error(f"Error creating job: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.put("/jobs/{job_id}/schedule")
-async def update_job_schedule(job_id: str, schedule_update: dict):
-    """Update a job's schedule"""
+@router.post("/jobs/{job_id}/run")
+async def run_job_now(
+    job_id: str, 
+    execution_request: JobExecutionRequest = None,
+    settings: Settings = Depends(get_settings)
+):
+    """Run a job immediately with max wallets"""
     try:
-        new_schedule = schedule_update.get("schedule")
-        if not new_schedule:
-            raise HTTPException(status_code=400, detail="Schedule is required")
+        # ALWAYS use max wallets for immediate execution
+        wallet_count_data = await get_wallet_count(settings)
+        actual_wallet_count = wallet_count_data["count"]
         
-        # Validate cron expression format (basic validation)
-        cron_parts = new_schedule.strip().split()
-        if len(cron_parts) != 5:
-            raise HTTPException(status_code=400, detail="Cron expression must have exactly 5 parts")
+        # Create execution request with max wallets if not provided
+        if execution_request is None:
+            execution_request = JobExecutionRequest()
         
-        # Get the current job
+        # Always override with max wallet count
+        execution_request.num_wallets = actual_wallet_count
+        
+        logger.info(f"Running job {job_id} immediately with {actual_wallet_count} wallets (max available)")
+        
+        # First trigger via scheduler
+        scheduler_success = await scheduler_service.run_job_now(job_id)
+        
+        # Also call the function directly for immediate feedback
         job = await scheduler_service.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        # Update the job with new schedule
-        success = await scheduler_service.update_job_schedule(job_id, new_schedule)
-        if not success:
-            raise HTTPException(status_code=400, detail="Failed to update job schedule")
+        if job:
+            payload = {
+                "network": job.network,
+                "analysis_type": job.analysis_type,
+                "num_wallets": actual_wallet_count,  # Use actual max count
+                "days_back": execution_request.days_back
+            }
+            
+            try:
+                timeout = httpx.Timeout(settings.api_timeout)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(settings.crypto_function_url, json=payload)
+                    
+                if response.status_code == 200:
+                    result = response.json()
+                    return {
+                        "success": True,
+                        "message": f"Job {job_id} executed successfully with {actual_wallet_count} wallets (max available)",
+                        "result": {
+                            "transactions": result.get("total_transactions", 0),
+                            "tokens": result.get("unique_tokens", 0),
+                            "eth_value": result.get("total_eth_value", 0),
+                            "wallets_used": actual_wallet_count,
+                            "wallet_source": wallet_count_data["source"]
+                        },
+                        "config_used": {
+                            "function_url": settings.crypto_function_url,
+                            "timeout": settings.api_timeout
+                        }
+                    }
+                else:
+                    return {
+                        "success": scheduler_success,
+                        "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (function call failed: HTTP {response.status_code})",
+                        "wallets_used": actual_wallet_count
+                    }
+                    
+            except Exception as func_error:
+                logger.warning(f"Direct function call failed: {func_error}")
+                return {
+                    "success": scheduler_success,
+                    "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (direct call failed)",
+                    "wallets_used": actual_wallet_count
+                }
         
         return {
-            "success": True, 
-            "message": f"Job {job_id} schedule updated to: {new_schedule}"
+            "success": scheduler_success, 
+            "message": f"Job {job_id} triggered with {actual_wallet_count} wallets",
+            "wallets_used": actual_wallet_count
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error updating job schedule {job_id}: {e}")
+        logger.error(f"Error running job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs/{job_id}/pause")
@@ -194,80 +271,6 @@ async def resume_job(job_id: str):
         logger.error(f"Error resuming job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/jobs/{job_id}/run")
-async def run_job_now(job_id: str, execution_request: JobExecutionRequest = None):
-    """Run a job immediately with max wallets"""
-    try:
-        # ALWAYS use max wallets for immediate execution
-        wallet_count_data = await get_wallet_count()
-        actual_wallet_count = wallet_count_data["count"]
-        
-        # Create execution request with max wallets if not provided
-        if execution_request is None:
-            execution_request = JobExecutionRequest()
-        
-        # Always override with max wallet count
-        execution_request.num_wallets = actual_wallet_count
-        
-        logger.info(f"Running job {job_id} immediately with {actual_wallet_count} wallets (max available)")
-        
-        # First trigger via scheduler
-        scheduler_success = await scheduler_service.run_job_now(job_id)
-        
-        # Also call the function directly for immediate feedback
-        job = await scheduler_service.get_job(job_id)
-        if job:
-            payload = {
-                "network": job.network,
-                "analysis_type": job.analysis_type,
-                "num_wallets": actual_wallet_count,  # Use actual max count
-                "days_back": execution_request.days_back
-            }
-            
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    response = await client.post(job.function_url, json=payload)
-                    
-                if response.status_code == 200:
-                    result = response.json()
-                    return {
-                        "success": True,
-                        "message": f"Job {job_id} executed successfully with {actual_wallet_count} wallets (max available)",
-                        "result": {
-                            "transactions": result.get("total_transactions", 0),
-                            "tokens": result.get("unique_tokens", 0),
-                            "eth_value": result.get("total_eth_value", 0),
-                            "wallets_used": actual_wallet_count,
-                            "wallet_source": wallet_count_data["source"]
-                        }
-                    }
-                else:
-                    return {
-                        "success": scheduler_success,
-                        "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (function call failed: HTTP {response.status_code})",
-                        "wallets_used": actual_wallet_count
-                    }
-                    
-            except Exception as func_error:
-                logger.warning(f"Direct function call failed: {func_error}")
-                return {
-                    "success": scheduler_success,
-                    "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (direct call failed)",
-                    "wallets_used": actual_wallet_count
-                }
-        
-        return {
-            "success": scheduler_success, 
-            "message": f"Job {job_id} triggered with {actual_wallet_count} wallets",
-            "wallets_used": actual_wallet_count
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error running job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str):
     """Delete a job"""
@@ -284,13 +287,13 @@ async def delete_job(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs/update-wallet-counts")
-async def update_all_jobs_wallet_counts():
+async def update_all_jobs_wallet_counts(settings: Settings = Depends(get_settings)):
     """Update all existing jobs to use the current maximum wallet count"""
     try:
         logger.info('Updating all jobs to use maximum wallet count...')
         
         # Get current max wallet count
-        wallet_count_data = await get_wallet_count()
+        wallet_count_data = await get_wallet_count(settings)
         max_wallets = wallet_count_data["count"]
         
         # Update all jobs
@@ -301,63 +304,19 @@ async def update_all_jobs_wallet_counts():
             "message": f"Updated {updated_count} jobs to use {max_wallets} wallets (max available)",
             "max_wallets": max_wallets,
             "wallet_source": wallet_count_data["source"],
-            "jobs_updated": updated_count
+            "jobs_updated": updated_count,
+            "config_used": {
+                "wallet_api_url": settings.wallet_api_url,
+                "timeout": settings.wallet_api_timeout
+            }
         }
         
     except Exception as e:
         logger.error(f"Error updating all jobs wallet counts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/jobs/pause-all")
-async def pause_all_jobs():
-    """Pause all jobs"""
-    try:
-        jobs = await scheduler_service.list_jobs()
-        results = []
-        
-        for job in jobs:
-            if job.state.value == "ENABLED":
-                success = await scheduler_service.pause_job(job.id)
-                results.append({"job_id": job.id, "success": success})
-        
-        success_count = sum(1 for r in results if r["success"])
-        
-        return {
-            "success": True,
-            "message": f"Paused {success_count}/{len(results)} jobs",
-            "results": results
-        }
-        
-    except Exception as e:
-        logger.error(f"Error pausing all jobs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/jobs/resume-all")
-async def resume_all_jobs():
-    """Resume all jobs"""
-    try:
-        jobs = await scheduler_service.list_jobs()
-        results = []
-        
-        for job in jobs:
-            if job.state.value == "PAUSED":
-                success = await scheduler_service.resume_job(job.id)
-                results.append({"job_id": job.id, "success": success})
-        
-        success_count = sum(1 for r in results if r["success"])
-        
-        return {
-            "success": True,
-            "message": f"Resumed {success_count}/{len(results)} jobs",
-            "results": results
-        }
-        
-    except Exception as e:
-        logger.error(f"Error resuming all jobs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @router.get("/status")
-async def get_status():
+async def get_status(settings: Settings = Depends(get_settings)):
     """Get overall system status"""
     try:
         jobs = await scheduler_service.list_jobs()
@@ -370,7 +329,7 @@ async def get_status():
         success_rate = (total_successes / total_executions * 100) if total_executions > 0 else 0
         
         # Get current wallet count
-        wallet_count_data = await get_wallet_count()
+        wallet_count_data = await get_wallet_count(settings)
         
         return {
             "total_jobs": len(jobs),
@@ -381,7 +340,9 @@ async def get_status():
             "wallet_count": wallet_count_data["count"],
             "wallet_count_source": wallet_count_data["source"],
             "wallet_count_success": wallet_count_data["success"],
-            "last_updated": "2025-08-27T12:00:00Z"
+            "app_version": settings.app_version,
+            "debug_mode": settings.debug,
+            "last_updated": "2025-09-11T12:00:00Z"
         }
         
     except Exception as e:
@@ -389,11 +350,11 @@ async def get_status():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/job-templates")
-async def get_job_templates():
+async def get_job_templates(settings: Settings = Depends(get_settings)):
     """Get predefined job templates with max wallet count and optimized schedules"""
     try:
         # Get current wallet count for templates
-        wallet_count_data = await get_wallet_count()
+        wallet_count_data = await get_wallet_count(settings)
         max_wallets = wallet_count_data["count"]
         
         templates = [
@@ -404,7 +365,7 @@ async def get_job_templates():
                 "analysis_type": "buy",
                 "schedule": "30 20,21,23,1,5,7,8,10 * * *",
                 "num_wallets": max_wallets,  # Always use max
-                "description": f"Optimized Base buy analysis (9:30AM, 10:30AM, 12:30PM, 2:30PM, 6:30PM, 8:30PM, 9:30PM, 11:30PM NZDST) using all {max_wallets} wallets"
+                "description": f"Optimized Base buy analysis using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-sell-analysis-base-optimized",
@@ -413,7 +374,7 @@ async def get_job_templates():
                 "analysis_type": "sell", 
                 "schedule": "30 20,22,0,3,6,9,11 * * *",
                 "num_wallets": max_wallets,  # Always use max
-                "description": f"Optimized Base sell analysis (9:30AM, 11:30AM, 1:30PM, 4:30PM, 7:30PM, 10:30PM, 12:30AM NZDST) using all {max_wallets} wallets"
+                "description": f"Optimized Base sell analysis using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-buy-analysis-ethereum",
@@ -422,7 +383,7 @@ async def get_job_templates():
                 "analysis_type": "buy",
                 "schedule": "0 */4 * * *",
                 "num_wallets": max_wallets,  # Always use max
-                "description": f"Analyzes buy transactions on Ethereum network every 4 hours using all {max_wallets} wallets"
+                "description": f"Ethereum buy analysis every 4 hours using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-sell-analysis-ethereum",
@@ -431,32 +392,15 @@ async def get_job_templates():
                 "analysis_type": "sell",
                 "schedule": "30 */6 * * *",
                 "num_wallets": max_wallets,  # Always use max
-                "description": f"Analyzes sell transactions on Ethereum network every 6 hours using all {max_wallets} wallets"
-            },
-            {
-                "id": "crypto-buy-analysis-base-simple",
-                "name": "Base Buy Analysis (Every 4 Hours)",
-                "network": "base", 
-                "analysis_type": "buy",
-                "schedule": "15 */4 * * *",
-                "num_wallets": max_wallets,  # Always use max
-                "description": f"Simple Base buy analysis every 4 hours using all {max_wallets} wallets"
-            },
-            {
-                "id": "crypto-sell-analysis-base-simple",
-                "name": "Base Sell Analysis (Every 6 Hours)",
-                "network": "base",
-                "analysis_type": "sell",
-                "schedule": "45 */6 * * *",
-                "num_wallets": max_wallets,  # Always use max
-                "description": f"Simple Base sell analysis every 6 hours using all {max_wallets} wallets"
+                "description": f"Ethereum sell analysis every 6 hours using all {max_wallets} wallets"
             }
         ]
         
         return {
             "templates": templates,
             "max_wallets": max_wallets,
-            "wallet_source": wallet_count_data["source"]
+            "wallet_source": wallet_count_data["source"],
+            "function_url": settings.crypto_function_url
         }
     except Exception as e:
         logger.error(f"Error getting job templates: {e}")
