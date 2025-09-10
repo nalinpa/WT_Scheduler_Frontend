@@ -103,13 +103,16 @@ async def get_job(job_id: str):
 
 @router.post("/jobs", response_model=dict)
 async def create_job(job_request: JobCreateRequest):
-    """Create a new scheduler job"""
+    """Create a new scheduler job - ALWAYS uses max available wallets"""
     try:
-        # If num_wallets is not specified or is 0, get the current max count
-        if not job_request.num_wallets or job_request.num_wallets == 0:
-            wallet_count_data = await get_wallet_count()
-            job_request.num_wallets = wallet_count_data["count"]
-            logger.info(f"Using wallet count from API: {job_request.num_wallets}")
+        # ALWAYS get the current max wallet count - ignore any provided value
+        wallet_count_data = await get_wallet_count()
+        actual_wallet_count = wallet_count_data["count"]
+        
+        # Override any provided num_wallets with the current max
+        job_request.num_wallets = actual_wallet_count
+        
+        logger.info(f"Creating job {job_request.id} with {actual_wallet_count} wallets (max available)")
         
         success = await scheduler_service.create_job(job_request)
         if not success:
@@ -117,7 +120,9 @@ async def create_job(job_request: JobCreateRequest):
         
         return {
             "success": True, 
-            "message": f"Job {job_request.id} created successfully with {job_request.num_wallets} wallets"
+            "message": f"Job {job_request.id} created successfully with {actual_wallet_count} wallets (max available)",
+            "wallet_count": actual_wallet_count,
+            "wallet_source": wallet_count_data["source"]
         }
     except HTTPException:
         raise
@@ -190,14 +195,21 @@ async def resume_job(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs/{job_id}/run")
-async def run_job_now(job_id: str, execution_request: JobExecutionRequest = JobExecutionRequest()):
-    """Run a job immediately"""
+async def run_job_now(job_id: str, execution_request: JobExecutionRequest = None):
+    """Run a job immediately with max wallets"""
     try:
-        # If num_wallets is not specified or is 0, get the current max count
-        if not execution_request.num_wallets or execution_request.num_wallets == 0:
-            wallet_count_data = await get_wallet_count()
-            execution_request.num_wallets = wallet_count_data["count"]
-            logger.info(f"Using wallet count from API for immediate execution: {execution_request.num_wallets}")
+        # ALWAYS use max wallets for immediate execution
+        wallet_count_data = await get_wallet_count()
+        actual_wallet_count = wallet_count_data["count"]
+        
+        # Create execution request with max wallets if not provided
+        if execution_request is None:
+            execution_request = JobExecutionRequest()
+        
+        # Always override with max wallet count
+        execution_request.num_wallets = actual_wallet_count
+        
+        logger.info(f"Running job {job_id} immediately with {actual_wallet_count} wallets (max available)")
         
         # First trigger via scheduler
         scheduler_success = await scheduler_service.run_job_now(job_id)
@@ -208,7 +220,7 @@ async def run_job_now(job_id: str, execution_request: JobExecutionRequest = JobE
             payload = {
                 "network": job.network,
                 "analysis_type": job.analysis_type,
-                "num_wallets": execution_request.num_wallets,
+                "num_wallets": actual_wallet_count,  # Use actual max count
                 "days_back": execution_request.days_back
             }
             
@@ -220,28 +232,35 @@ async def run_job_now(job_id: str, execution_request: JobExecutionRequest = JobE
                     result = response.json()
                     return {
                         "success": True,
-                        "message": f"Job {job_id} executed successfully with {execution_request.num_wallets} wallets",
+                        "message": f"Job {job_id} executed successfully with {actual_wallet_count} wallets (max available)",
                         "result": {
                             "transactions": result.get("total_transactions", 0),
                             "tokens": result.get("unique_tokens", 0),
                             "eth_value": result.get("total_eth_value", 0),
-                            "wallets_used": execution_request.num_wallets
+                            "wallets_used": actual_wallet_count,
+                            "wallet_source": wallet_count_data["source"]
                         }
                     }
                 else:
                     return {
                         "success": scheduler_success,
-                        "message": f"Job {job_id} triggered via scheduler (function call failed: HTTP {response.status_code})"
+                        "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (function call failed: HTTP {response.status_code})",
+                        "wallets_used": actual_wallet_count
                     }
                     
             except Exception as func_error:
                 logger.warning(f"Direct function call failed: {func_error}")
                 return {
                     "success": scheduler_success,
-                    "message": f"Job {job_id} triggered via scheduler (direct call failed)"
+                    "message": f"Job {job_id} triggered via scheduler with {actual_wallet_count} wallets (direct call failed)",
+                    "wallets_used": actual_wallet_count
                 }
         
-        return {"success": scheduler_success, "message": f"Job {job_id} triggered"}
+        return {
+            "success": scheduler_success, 
+            "message": f"Job {job_id} triggered with {actual_wallet_count} wallets",
+            "wallets_used": actual_wallet_count
+        }
         
     except HTTPException:
         raise
@@ -262,6 +281,31 @@ async def delete_job(job_id: str):
         raise
     except Exception as e:
         logger.error(f"Error deleting job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/jobs/update-wallet-counts")
+async def update_all_jobs_wallet_counts():
+    """Update all existing jobs to use the current maximum wallet count"""
+    try:
+        logger.info('Updating all jobs to use maximum wallet count...')
+        
+        # Get current max wallet count
+        wallet_count_data = await get_wallet_count()
+        max_wallets = wallet_count_data["count"]
+        
+        # Update all jobs
+        updated_count = await scheduler_service.update_all_jobs_wallet_count()
+        
+        return {
+            "success": True,
+            "message": f"Updated {updated_count} jobs to use {max_wallets} wallets (max available)",
+            "max_wallets": max_wallets,
+            "wallet_source": wallet_count_data["source"],
+            "jobs_updated": updated_count
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating all jobs wallet counts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs/pause-all")
@@ -359,8 +403,8 @@ async def get_job_templates():
                 "network": "base", 
                 "analysis_type": "buy",
                 "schedule": "30 20,21,23,1,5,7,8,10 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Optimized Base buy analysis (9:30AM, 10:30AM, 12:30PM, 2:30PM, 6:30PM, 8:30PM, 9:30PM, 11:30PM NZDST) using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Optimized Base buy analysis (9:30AM, 10:30AM, 12:30PM, 2:30PM, 6:30PM, 8:30PM, 9:30PM, 11:30PM NZDST) using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-sell-analysis-base-optimized",
@@ -368,8 +412,8 @@ async def get_job_templates():
                 "network": "base",
                 "analysis_type": "sell", 
                 "schedule": "30 20,22,0,3,6,9,11 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Optimized Base sell analysis (9:30AM, 11:30AM, 1:30PM, 4:30PM, 7:30PM, 10:30PM, 12:30AM NZDST) using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Optimized Base sell analysis (9:30AM, 11:30AM, 1:30PM, 4:30PM, 7:30PM, 10:30PM, 12:30AM NZDST) using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-buy-analysis-ethereum",
@@ -377,8 +421,8 @@ async def get_job_templates():
                 "network": "ethereum",
                 "analysis_type": "buy",
                 "schedule": "0 */4 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Analyzes buy transactions on Ethereum network every 4 hours using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Analyzes buy transactions on Ethereum network every 4 hours using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-sell-analysis-ethereum",
@@ -386,8 +430,8 @@ async def get_job_templates():
                 "network": "ethereum",
                 "analysis_type": "sell",
                 "schedule": "30 */6 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Analyzes sell transactions on Ethereum network every 6 hours using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Analyzes sell transactions on Ethereum network every 6 hours using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-buy-analysis-base-simple",
@@ -395,8 +439,8 @@ async def get_job_templates():
                 "network": "base", 
                 "analysis_type": "buy",
                 "schedule": "15 */4 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Simple Base buy analysis every 4 hours using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Simple Base buy analysis every 4 hours using all {max_wallets} wallets"
             },
             {
                 "id": "crypto-sell-analysis-base-simple",
@@ -404,8 +448,8 @@ async def get_job_templates():
                 "network": "base",
                 "analysis_type": "sell",
                 "schedule": "45 */6 * * *",
-                "num_wallets": max_wallets,
-                "description": f"Simple Base sell analysis every 6 hours using {max_wallets} wallets"
+                "num_wallets": max_wallets,  # Always use max
+                "description": f"Simple Base sell analysis every 6 hours using all {max_wallets} wallets"
             }
         ]
         
