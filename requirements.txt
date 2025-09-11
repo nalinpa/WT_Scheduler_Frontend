@@ -13,3 +13,4 @@ httpx==0.25.2
 # Additional useful packages for better functionality
 requests==2.31.0
 typing-extensions==4.8.0
+redis==5.0.1
