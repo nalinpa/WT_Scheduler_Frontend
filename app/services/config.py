@@ -2,8 +2,11 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 from functools import lru_cache
 from typing import Optional
+import os
 
 class Settings(BaseSettings):
+    """Settings that read from .env file and environment variables"""
+    
     # Google Cloud Configuration
     google_cloud_project: str = Field(
         default="crypto-tracker-cloudrun",
@@ -75,12 +78,57 @@ class Settings(BaseSettings):
     )
 
     class Config:
+        # This tells Pydantic where to find the .env file
         env_file = ".env"
         env_file_encoding = "utf-8"
-        case_sensitive = False  # Allow both upper and lower case env vars
+        case_sensitive = False  # WALLET_API_URL or wallet_api_url both work
         extra = "ignore"  # Ignore extra environment variables
+        
+    def __init__(self, **kwargs):
+        """Initialize settings with debug info"""
+        super().__init__(**kwargs)
+        
+        # Debug: Show where values are coming from
+        if os.getenv("DEBUG", "").lower() in ["true", "1", "yes"]:
+            print(f"🔧 Config Debug:")
+            print(f"   .env file exists: {os.path.exists('.env')}")
+            print(f"   WALLET_API_URL from env: {os.getenv('WALLET_API_URL', 'NOT_SET')}")
+            print(f"   DEBUG from env: {os.getenv('DEBUG', 'NOT_SET')}")
+            print(f"   Loaded wallet_api_url: {self.wallet_api_url}")
+            print(f"   Loaded debug: {self.debug}")
 
 @lru_cache()
 def get_settings() -> Settings:
     """Get cached settings instance"""
     return Settings()
+
+# Test function to verify config is working
+def test_config():
+    """Test function to verify environment loading"""
+    print("🧪 Testing configuration...")
+    
+    settings = get_settings()
+    
+    print(f"App Name: {settings.app_name}")
+    print(f"Debug Mode: {settings.debug}")
+    print(f"Wallet API URL: {settings.wallet_api_url}")
+    print(f"Google Cloud Project: {settings.google_cloud_project}")
+    
+    # Check if we're getting values from .env
+    env_debug = os.getenv("DEBUG")
+    if env_debug:
+        print(f"✅ Reading DEBUG from environment: {env_debug}")
+    else:
+        print("⚠️ DEBUG not found in environment variables")
+        
+    env_wallet_url = os.getenv("WALLET_API_URL")
+    if env_wallet_url:
+        print(f"✅ Reading WALLET_API_URL from environment: {env_wallet_url}")
+    else:
+        print("⚠️ WALLET_API_URL not found in environment variables")
+    
+    return settings
+
+if __name__ == "__main__":
+    # Test the configuration when run directly
+    test_config()

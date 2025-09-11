@@ -2,7 +2,7 @@ import os
 import uvicorn
 import logging
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,7 @@ load_dotenv()
 # Get settings
 settings = get_settings()
 
-# Configure logging based on settings
+# Configure logging
 log_level = logging.DEBUG if settings.debug else logging.INFO
 logging.basicConfig(
     level=log_level,
@@ -26,21 +26,18 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app with config-driven settings
+# Create FastAPI app
 app = FastAPI(
     title=settings.app_name,
-    description="Config-driven crypto analysis scheduler dashboard",
+    description="Crypto analysis scheduler dashboard",
     version=settings.app_version,
     debug=settings.debug
 )
 
-# Add CORS middleware with config-aware settings
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.debug else [
-        "https://*.run.app", 
-        "https://*.googleapis.com"
-    ],
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,12 +54,13 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # Templates
 templates = Jinja2Templates(directory="app/templates")
 
-# Include API routes
+# IMPORTANT: Include API routes with /api prefix
 app.include_router(scheduler_router, prefix="/api", tags=["scheduler"])
 
+# Root endpoint - dashboard
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, settings: Settings = Depends(get_settings)):
-    """Main dashboard page with config-driven template variables"""
+    """Main dashboard page"""
     logger.info(f"Serving dashboard for {settings.app_name} v{settings.app_version}")
     
     return templates.TemplateResponse("dashboard.html", {
@@ -70,43 +68,39 @@ async def dashboard(request: Request, settings: Settings = Depends(get_settings)
         "project_id": settings.google_cloud_project,
         "region": settings.google_cloud_region,
         "function_url": settings.crypto_function_url,
-        "wallet_api_url": settings.wallet_api_url,
+        "wallet_api_url": getattr(settings, 'wallet_api_url', 'https://wallet-api-bigquery-qz6f5mkbmq-as.a.run.app'),
         "app_name": settings.app_name,
         "app_version": settings.app_version,
         "debug": settings.debug
     })
 
+# Health check endpoint
 @app.get("/health")
 async def health_check(settings: Settings = Depends(get_settings)):
-    """Health check endpoint with config information"""
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "service": settings.app_name,
         "version": settings.app_version,
         "debug": settings.debug,
-        "environment": "development" if settings.debug else "production",
-        "google_cloud_project": settings.google_cloud_project,
-        "google_cloud_region": settings.google_cloud_region
+        "environment": "development" if settings.debug else "production"
     }
 
-@app.get("/config")
-async def get_app_config(settings: Settings = Depends(get_settings)):
-    """Get application configuration (safe values only)"""
-    return {
-        "app_name": settings.app_name,
-        "app_version": settings.app_version,
-        "debug": settings.debug,
-        "google_cloud_project": settings.google_cloud_project,
-        "google_cloud_region": settings.google_cloud_region,
-        "crypto_function_url": settings.crypto_function_url,
-        "wallet_api_url": settings.wallet_api_url,
-        "api_timeout": settings.api_timeout,
-        "wallet_api_timeout": settings.wallet_api_timeout,
-        "max_retries": settings.max_retries,
-        "rate_limit_enabled": settings.rate_limit_enabled,
-        # Note: Don't expose secret_key, admin_password, etc.
-    }
+# Debug endpoint to list all routes
+@app.get("/debug/routes")
+async def list_routes():
+    """Debug endpoint to show all available routes"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, 'methods') and hasattr(route, 'path'):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods),
+                "name": getattr(route, 'name', 'Unknown')
+            })
+    return {"routes": routes}
 
+# Application startup event
 @app.on_event("startup")
 async def startup_event():
     """Application startup event"""
@@ -116,16 +110,18 @@ async def startup_event():
     logger.info(f"☁️ Google Cloud Project: {settings.google_cloud_project}")
     logger.info(f"🌍 Region: {settings.google_cloud_region}")
     logger.info(f"🔗 Crypto Function: {settings.crypto_function_url}")
-    logger.info(f"💰 Wallet API: {settings.wallet_api_url}")
     
-    # Test connectivity to wallet API on startup
+    # Test wallet API connectivity
+    wallet_api_url = getattr(settings, 'wallet_api_url', 'https://wallet-api-bigquery-qz6f5mkbmq-as.a.run.app')
+    logger.info(f"💰 Wallet API: {wallet_api_url}")
+    
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=settings.wallet_api_timeout) as client:
-            response = await client.get(f"{settings.wallet_api_url}/wallets/count")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{wallet_api_url}/wallets/count")
             if response.status_code == 200:
                 data = response.json()
-                wallet_count = data.get("count", 0)
+                wallet_count = data.get("count", 0) if isinstance(data, dict) else int(data)
                 logger.info(f"✅ Wallet API connected: {wallet_count} wallets available")
             else:
                 logger.warning(f"⚠️ Wallet API returned status {response.status_code}")
@@ -142,11 +138,15 @@ if __name__ == "__main__":
     # Get port from environment or use default
     port = int(os.environ.get("PORT", 8080))
     
+    # Log startup info
+    logger.info(f"Starting server on port {port}")
+    logger.info(f"Debug mode: {settings.debug}")
+    
     # Use config settings for uvicorn
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=port, 
-        reload=settings.debug,  # Auto-reload in debug mode
+        reload=settings.debug,
         log_level="debug" if settings.debug else "info"
     )
